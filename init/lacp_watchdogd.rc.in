@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Copyright (c) 2026 Netflix, Inc.
+#
+
+# PROVIDE: lacp_watchdogd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="lacp_watchdogd"
+rcvar="lacp_watchdogd_enable"
+
+load_rc_config ${name}
+
+: ${lacp_watchdogd_enable:="NO"}
+: ${lacp_watchdogd_args:=""}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -S -T lacp-watchdogd -P ${pidfile} %%PREFIX%%/sbin/lacp-watchdogd ${lacp_watchdogd_args}"
+
+run_rc_command "$1"
