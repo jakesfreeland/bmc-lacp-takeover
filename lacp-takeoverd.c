@@ -8,6 +8,7 @@
 #include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 
@@ -39,6 +40,17 @@
 /* D-Bus name for systemd-networkd service. */
 #define	NETWORK1	"org.freedesktop.network1"
 
+/* Runtime systemd-networkd configuration directory. */
+#define	RUN_DIR		"/run/systemd/network"
+
+/* Name of the runtime drop-ins written during takeover. */
+#define	DROPIN		"99-lacp-takeover.conf"
+
+/* Time to wait for systemd-networkd to configure a link. */
+#define	SETTLE_TIMEOUT_MS	5000
+#define	SETTLE_POLL_MS		100
+#define	SETTLE_TRIES		(SETTLE_TIMEOUT_MS / SETTLE_POLL_MS)
+
 /* Maximum back-to-back reset fails before giving up. */
 #define	MAX_B2B_FAILS	2
 
@@ -46,6 +58,13 @@
 #define	MAX_CONNS	8
 
 #define	dbgprintf(...)	do { if (DEBUG) printf(__VA_ARGS__); } while (0)
+
+/* Watchdog connections and when they last sent a valid message (0 if never). */
+static struct conn {
+	int fd;
+	time_t last;
+} conns[MAX_CONNS];
+static int nconns;
 
 static const char *NCSI_IFNAME = "eth1";
 static const char *BOND_IFNAME = "bond0";
@@ -89,138 +108,28 @@ usage()
 	exit(EXIT_FAILURE);
 }
 
-static int
-handback(int nlfd)
+static void
+drop_conn(int fd)
 {
-	struct addr addr[8], gw[4];
-	int naddr, ngw;
-	unsigned int bond_idx, ncsi_idx;
-
-	ncsi_idx = if_nametoindex(NCSI_IFNAME);
-	if (ncsi_idx == 0) {
-		warn("if_nametoindex(%s)", NCSI_IFNAME);
-		return -1;
+	close(fd);
+	for (int i = 0; i < nconns; i++) {
+		if (conns[i].fd == fd) {
+			conns[i] = conns[--nconns];
+			return;
+		}
 	}
-	bond_idx = if_nametoindex(BOND_IFNAME);
-	if (bond_idx == 0) {
-		warn("if_nametoindex(%s)", BOND_IFNAME);
-		return -1;
-	}
-
-	naddr = addrs(BOND_IFNAME, addr, 8);
-	ngw = gateways(nlfd, AF_UNSPEC, bond_idx, gw, 4);
-	if (naddr < 0 || ngw < 0)
-		return -1;
-	dbgprintf("handing back: releasing %s from %s with %d addresses and %d gateways\n",
-	    NCSI_IFNAME, BOND_IFNAME, naddr, ngw);
-
-	if (set_addrs(nlfd, RTM_DELADDR, bond_idx, addr, naddr) ||
-	    set_link(nlfd, bond_idx, 0) ||
-	    set_link_attr(nlfd, ncsi_idx, IFLA_MASTER, &(int){ 0 }, sizeof(int)) ||
-	    set_link(nlfd, ncsi_idx, IFF_UP) ||
-	    set_addrs(nlfd, RTM_NEWADDR, ncsi_idx, addr, naddr) ||
-	    add_routes(nlfd, ncsi_idx, gw, ngw))
-		return -1;
-	return 0;
-}
-
-static int
-takeover(int nlfd)
-{
-	struct addr addr[8], gw[4];
-	struct ifreq ifr = { };
-	int naddr, ngw;
-	unsigned int bond_idx, ncsi_idx;
-
-	ncsi_idx = if_nametoindex(NCSI_IFNAME);
-	if (ncsi_idx == 0) {
-		warn("if_nametoindex(%s)", NCSI_IFNAME);
-		return -1;
-	}
-	bond_idx = if_nametoindex(BOND_IFNAME);
-	if (bond_idx == 0) {
-		warn("if_nametoindex(%s)", BOND_IFNAME);
-		return -1;
-	}
-
-	naddr = addrs(NCSI_IFNAME, addr, 8);
-	ngw = gateways(nlfd, AF_UNSPEC, ncsi_idx, gw, 4);
-	if (naddr < 0 || ngw < 0)
-		return -1;
-	dbgprintf("taking over: enslaving %s to %s with %d addresses and %d gateways\n",
-	    NCSI_IFNAME, BOND_IFNAME, naddr, ngw);
-
-	strncpy(ifr.ifr_name, NCSI_IFNAME, sizeof(ifr.ifr_name) - 1);
-	if (ioctl(nlfd, SIOCGIFHWADDR, &ifr)) {
-		warn("ioctl(SIOCGIFHWADDR, %s)", NCSI_IFNAME);
-		return -1;
-	}
-
-	if (set_addrs(nlfd, RTM_DELADDR, ncsi_idx, addr, naddr) ||
-	    set_link(nlfd, ncsi_idx, 0) ||
-	    set_link_attr(nlfd, bond_idx, IFLA_ADDRESS, ifr.ifr_hwaddr.sa_data, ETH_ALEN) ||
-	    set_link_attr(nlfd, ncsi_idx, IFLA_MASTER, &bond_idx, sizeof(bond_idx)) ||
-	    set_link(nlfd, bond_idx, IFF_UP) ||
-	    set_addrs(nlfd, RTM_NEWADDR, bond_idx, addr, naddr) ||
-	    add_routes(nlfd, bond_idx, gw, ngw))
-		return -1;
-	return 0;
 }
 
 static void
-reconfigure(sd_bus *bus, const char *ifname)
+touch_conn(int fd)
 {
-	sd_bus_error e = SD_BUS_ERROR_NULL;
-	char idx[16], *path, *state;
-	int i, r;
+	struct timespec ts;
 
-	snprintf(idx, sizeof(idx), "%u", if_nametoindex(ifname));
-	r = sd_bus_path_encode("/org/freedesktop/network1/link", idx, &path);
-	if (r < 0)
-		errx(EXIT_FAILURE, "sd_bus_path_encode: %s", strerror(-r));
-
-	r = sd_bus_call_method(bus, NETWORK1, path, NETWORK1 ".Link",
-	    "Reconfigure", &e, NULL, "");
-	if (r < 0) {
-		errx(EXIT_FAILURE, "reconfigure %s: %s", ifname,
-		    e.message ?: strerror(-r));
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	for (int i = 0; i < nconns; i++) {
+		if (conns[i].fd == fd)
+			conns[i].last = ts.tv_sec + 1;
 	}
-
-	for (i = 0; i < 10; ++i) {
-		r = sd_bus_get_property_string(bus, NETWORK1, path,
-		    NETWORK1 ".Link", "AdministrativeState", &e, &state);
-		if (r < 0) {
-			errx(EXIT_FAILURE, "get %s state: %s", ifname,
-			    e.message ?: strerror(-r));
-		}
-		if (strcmp(state, "configuring") != 0)
-			break;
-		free(state);
-		usleep(100000);
-	}
-
-	if (i == 10) {
-		warnx("timed out waiting for %s to be reconfigured by "
-		    "systemd-networkd", ifname);
-	} else {
-		if (strcmp(state, "configured") != 0 &&
-		    strcmp(state, "unmanaged") != 0) {
-			errx(EXIT_FAILURE, "%s is %s after reconfiguration",
-			     ifname, state);
-		}
-		free(state);
-	}
-
-	free(path);
-}
-
-static void
-reset(sd_bus *bus)
-{
-	warnx("restoring %s and %s to their systemd-networkd configuration",
-	    BOND_IFNAME, NCSI_IFNAME);
-	reconfigure(bus, BOND_IFNAME);
-	reconfigure(bus, NCSI_IFNAME);
 }
 
 static bool
@@ -242,6 +151,295 @@ enslaved(void)
 	return strcmp(name ? name + 1 : target, BOND_IFNAME) == 0;
 }
 
+static char *
+link_path(const char *ifname)
+{
+	char idx[16], *path;
+	int r;
+
+	snprintf(idx, sizeof(idx), "%u", if_nametoindex(ifname));
+	r = sd_bus_path_encode("/org/freedesktop/network1/link", idx, &path);
+	if (r < 0)
+		errx(EXIT_FAILURE, "sd_bus_path_encode: %s", strerror(-r));
+	return path;
+}
+
+static void
+settle(sd_bus *bus, const char *ifname)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	char *path, *state;
+	int i, r;
+
+	path = link_path(ifname);
+	for (i = 0; i < SETTLE_TRIES; ++i) {
+		r = sd_bus_get_property_string(bus, NETWORK1, path,
+		    NETWORK1 ".Link", "AdministrativeState", &e, &state);
+		if (r < 0) {
+			errx(EXIT_FAILURE, "get %s state: %s", ifname,
+			    e.message ?: strerror(-r));
+		}
+		if (strcmp(state, "pending") != 0 &&
+		    strcmp(state, "initialized") != 0 &&
+		    strcmp(state, "configuring") != 0)
+			break;
+		free(state);
+		usleep(SETTLE_POLL_MS * 1000);
+	}
+
+	if (i == SETTLE_TRIES) {
+		warnx("timed out waiting for %s to be configured by "
+		    "systemd-networkd", ifname);
+	} else {
+		if (strcmp(state, "configured") != 0 &&
+		    strcmp(state, "unmanaged") != 0) {
+			errx(EXIT_FAILURE, "%s is %s after configuration",
+			     ifname, state);
+		}
+		free(state);
+	}
+
+	free(path);
+}
+
+static void
+reconfigure(sd_bus *bus, const char *ifname)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	char *path;
+	int r;
+
+	path = link_path(ifname);
+	r = sd_bus_call_method(bus, NETWORK1, path, NETWORK1 ".Link",
+	    "Reconfigure", &e, NULL, "");
+	if (r < 0) {
+		errx(EXIT_FAILURE, "reconfigure %s: %s", ifname,
+		    e.message ?: strerror(-r));
+	}
+	free(path);
+	settle(bus, ifname);
+}
+
+static void
+reload(sd_bus *bus)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r;
+
+	r = sd_bus_call_method(bus, NETWORK1, "/org/freedesktop/network1",
+	    NETWORK1 ".Manager", "Reload", &e, NULL, "");
+	if (r < 0) {
+		errx(EXIT_FAILURE, "reload systemd-networkd: %s",
+		    e.message ?: strerror(-r));
+	}
+}
+
+static int
+if_dropin_dir(const char *ifname, char *dir, size_t dirlen)
+{
+	FILE *f;
+	unsigned int if_idx;
+	char path[PATH_MAX], line[LINE_MAX];
+	const char key[] = "NETWORK_FILE=", *name = NULL;
+
+	if_idx = if_nametoindex(ifname);
+	if (if_idx == 0) {
+		warn("if_nametoindex(%s)", ifname);
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "/run/systemd/netif/links/%u", if_idx);
+	f = fopen(path, "r");
+	if (f == NULL) {
+		warn("fopen(%s)", path);
+		return -1;
+	}
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, key, sizeof(key) - 1) != 0)
+			continue;
+		*strchrnul(line, '\n') = '\0';
+		name = strrchr(line, '/');
+		name = name != NULL ? name + 1 : &line[sizeof(key) - 1];
+		break;
+	}
+
+	fclose(f);
+
+	if (name == NULL) {
+		warnx("%s has no systemd-networkd network file", ifname);
+		return -1;
+	}
+
+	if (snprintf(dir, dirlen, "%s/%s.d", RUN_DIR, name) >= dirlen) {
+		warnx("drop-in directory path too long: %s/%s.d", RUN_DIR, name);
+		return -1;
+	}
+
+	return 0;
+}
+
+static FILE *
+open_dropin(const char *dir)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	if (mkdir(dir, 0755) && errno != EEXIST) {
+		warn("mkdir(%s)", dir);
+		return NULL;
+	}
+
+	if (snprintf(path, sizeof(path), "%s/%s", dir, DROPIN) >= sizeof(path)) {
+		warnx("drop-in path too long: %s/%s", dir, DROPIN);
+		return NULL;
+	}
+
+	f = fopen(path, "w");
+	if (f == NULL)
+		warn("fopen(%s)", path);
+	return f;
+}
+
+static void
+remove_dropin(const char *dir)
+{
+	char path[PATH_MAX];
+
+	if (snprintf(path, sizeof(path), "%s/%s", dir, DROPIN) >= sizeof(path))
+		return;
+	(void)unlink(path);
+	(void)rmdir(dir);
+}
+
+static const char *
+fmt_mac(const unsigned char *mac)
+{
+	static char mac_str[18];
+
+	snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	return mac_str;
+}
+
+static int
+write_bond_dropin(const char *dir, const unsigned char *mac, struct addr *addr,
+    int naddr, struct addr *gw, int ngw)
+{
+	char ip[INET6_ADDRSTRLEN];
+	FILE *f;
+	int i;
+
+	f = open_dropin(dir);
+	if (f == NULL)
+		return -1;
+	fprintf(f, "[Link]\nMACAddress=%s\n", fmt_mac(mac));
+	for (i = 0; i < naddr; i++) {
+		fprintf(f, "\n[Address]\nAddress=%s/%d\n", inet_ntop(addr[i].family,
+		    addr[i].data, ip, sizeof(ip)), addr[i].prefix);
+	}
+	for (i = 0; i < ngw; i++) {
+		fprintf(f, "\n[Route]\nGateway=%s\nMetric=%d\n", inet_ntop(gw[i].family,
+		    gw[i].data, ip, sizeof(ip)), gw[i].metric);
+	}
+	fclose(f);
+	return 0;
+}
+
+static int
+takeover(int nlfd, sd_bus *bus)
+{
+	struct addr *addr = NULL, *gw = NULL;
+	struct ifreq ifr = { };
+	char bdir[PATH_MAX], ndir[PATH_MAX];
+	const unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+	FILE *f;
+	int i, naddr, ngw, ret = -1;
+
+	naddr = addrs(NCSI_IFNAME, &addr);
+	ngw = gateways(nlfd, AF_UNSPEC, NCSI_IFNAME, &gw);
+	if (naddr < 0 || ngw < 0)
+		goto out;
+	dbgprintf("taking over: enslaving %s to %s with %d addresses and %d gateways\n",
+	    NCSI_IFNAME, BOND_IFNAME, naddr, ngw);
+
+	strncpy(ifr.ifr_name, NCSI_IFNAME, sizeof(ifr.ifr_name) - 1);
+	if (ioctl(nlfd, SIOCGIFHWADDR, &ifr)) {
+		warn("ioctl(SIOCGIFHWADDR, %s)", NCSI_IFNAME);
+		goto out;
+	}
+
+	/*
+	 * Apply the bond MAC before enslaving, otherwise the kernel keeps the
+	 * old MAC as the LACP system ID. Addresses and routes come after
+	 * enslaving: without carrier, IPv6 addresses stay tentative and the
+	 * bond never finishes configuring.
+	 */
+	if (if_dropin_dir(BOND_IFNAME, bdir, sizeof(bdir)) ||
+	    write_bond_dropin(bdir, mac, NULL, 0, NULL, 0))
+		goto out;
+	reload(bus);
+	reconfigure(bus, BOND_IFNAME);
+
+	if (if_dropin_dir(NCSI_IFNAME, ndir, sizeof(ndir)))
+		goto out;
+	f = open_dropin(ndir);
+	if (f == NULL)
+		goto out;
+	fprintf(f, "[Network]\nBond=%s\nAddress=\nGateway=\nDHCP=no\n"
+	    "IPv6AcceptRA=no\n", BOND_IFNAME);
+	fclose(f);
+
+	reload(bus);
+	for (i = 0; i < SETTLE_TRIES && !enslaved(); i++)
+		usleep(SETTLE_POLL_MS * 1000);
+	if (i == SETTLE_TRIES) {
+		warnx("timed out waiting for systemd-networkd to enslave %s to %s",
+		    NCSI_IFNAME, BOND_IFNAME);
+		goto out;
+	}
+
+	if (write_bond_dropin(bdir, mac, addr, naddr, gw, ngw))
+		goto out;
+	reload(bus);
+	reconfigure(bus, BOND_IFNAME);
+	ret = 0;
+out:
+	free(addr);
+	free(gw);
+	return ret;
+}
+
+static int
+handback(sd_bus *bus)
+{
+	char dir[PATH_MAX];
+
+	dbgprintf("handing back: releasing %s from %s\n", NCSI_IFNAME,
+	    BOND_IFNAME);
+
+	if (if_dropin_dir(NCSI_IFNAME, dir, sizeof(dir)))
+		return -1;
+	remove_dropin(dir);
+	if (if_dropin_dir(BOND_IFNAME, dir, sizeof(dir)))
+		return -1;
+	remove_dropin(dir);
+
+	reload(bus);
+	reconfigure(bus, NCSI_IFNAME);
+	reconfigure(bus, BOND_IFNAME);
+
+	return 0;
+}
+
+static void
+reset(sd_bus *bus)
+{
+	warnx("restoring %s to its systemd-networkd configuration",
+	    NCSI_IFNAME);
+	(void)handback(bus);
+}
+
 static enum lacp_partner
 get_switch_partner(int nlfd, const struct lacp_frame *frame)
 {
@@ -260,16 +458,6 @@ get_switch_partner(int nlfd, const struct lacp_frame *frame)
 	if (memcmp(frame->partner.sys_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN) == 0)
 		return BMC;
 	return HOST;
-}
-
-static const char *
-fmt_mac(const unsigned char *mac)
-{
-	static char mac_str[18];
-
-	snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-	return mac_str;
 }
 
 static int
@@ -327,7 +515,7 @@ main(int argc, char *argv[])
 	sd_bus *bus;
 	pcap_t *pcap;
 	enum lacp_partner partner = HOST;
-	int b2b_fails = 0, cfd, efd, nconns = 0, nlfd, opt, pfd, r, sfd, tfd, wfd;
+	int b2b_fails = 0, cfd, efd, nlfd, opt, pfd, r, sfd, tfd, wfd;
 	const char *watchdog_addr = DEF_WATCHDOG_ADDR;
 	char errbuf[PCAP_ERRBUF_SIZE];
 	bool host_active;
@@ -519,12 +707,21 @@ main(int argc, char *argv[])
 				warn("accept");
 				continue;
 			}
+			/*
+			 * A rebooted host leaves its old connection open, so make
+			 * room by dropping the one that has been quiet the longest.
+			 */
 			if (nconns == MAX_CONNS) {
-				dbgprintf("too many watchdog connections, dropping new one\n");
-				close(cfd);
-				continue;
+				int old = 0;
+
+				for (int i = 1; i < nconns; i++) {
+					if (conns[i].last < conns[old].last)
+						old = i;
+				}
+				dbgprintf("too many watchdog connections, dropping the quietest\n");
+				drop_conn(conns[old].fd);
 			}
-			nconns++;
+			conns[nconns++] = (struct conn){ .fd = cfd };
 			ev.events = EPOLLIN;
 			ev.data.fd = cfd;
 			if (epoll_ctl(efd, EPOLL_CTL_ADD, cfd, &ev))
@@ -552,8 +749,7 @@ main(int argc, char *argv[])
 					warn("read(%d): failed to read watchdog message",
 					     ev.data.fd);
 				}
-				close(ev.data.fd);
-				nconns--;
+				drop_conn(ev.data.fd);
 				continue;
 			}
 
@@ -561,8 +757,7 @@ main(int argc, char *argv[])
 			if (!wm_op_len_verify(wm.wm_op, wm.wm_len)) {
 				warnx("unexpected payload size for op %s: %u",
 				      wm_op_str(wm.wm_op), wm.wm_len);
-				close(ev.data.fd);
-				nconns--;
+				drop_conn(ev.data.fd);
 				continue;
 			}
 
@@ -581,8 +776,7 @@ main(int argc, char *argv[])
 				    MSG_DONTWAIT) != sizeof(timeout)) {
 					warnx("recv(%d): missing watchdog timeout",
 					    ev.data.fd);
-					close(ev.data.fd);
-					nconns--;
+					drop_conn(ev.data.fd);
 					continue;
 				}
 				its.it_value.tv_sec = ntohl(timeout);
@@ -605,22 +799,22 @@ main(int argc, char *argv[])
 			default:
 				warnx("read(%d): invalid watchdog op code: %hhu",
 				    ev.data.fd, wm.wm_op);
-				close(ev.data.fd);
-				nconns--;
+				drop_conn(ev.data.fd);
 				continue;
 			}
+			touch_conn(ev.data.fd);
 		}
 
 		owned = enslaved();
 		if ((partner == HOST || host_active) && owned) {
-			if (handback(nlfd) == 0) {
+			if (handback(bus) == 0) {
 				printf("LACP bundle restored to the host\n");
 				b2b_fails = 0;
 				continue;
 			}
 			warnx("failed to hand back LACP");
 		} else if (partner == NONE && !host_active && !owned) {
-			if (takeover(nlfd) == 0) {
+			if (takeover(nlfd, bus) == 0) {
 				printf("took over LACP on %s\n", NCSI_IFNAME);
 				b2b_fails = 0;
 				continue;

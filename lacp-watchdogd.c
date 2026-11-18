@@ -85,20 +85,18 @@ gateway_reachable(int fd, int nlfd, const char *ifname, uint16_t seq)
 	struct sockaddr_in dst = { .sin_family = AF_INET };
 	struct icmp req = { .icmp_type = ICMP_ECHO }, *icmp;
 	alignas(struct ip) unsigned char buf[512];
-	struct addr gw;
-	unsigned int if_idx = 0;
+	struct addr *gw;
 	struct ip *ip;
 	ssize_t n;
 
-	if (ifname != NULL && (if_idx = if_nametoindex(ifname)) == 0)
-		return false;
-
-	if (gateways(nlfd, AF_INET, if_idx, &gw, 1) < 1) {
+	if (gateways(nlfd, AF_INET, ifname, &gw) < 1) {
 		dbgprintf("no default gateway found\n");
+		free(gw);
 		return false;
 	}
 
-	memcpy(&dst.sin_addr, gw.data, sizeof(dst.sin_addr));
+	memcpy(&dst.sin_addr, gw[0].data, sizeof(dst.sin_addr));
+	free(gw);
 
 	req.icmp_id = htons(getpid());
 	req.icmp_seq = htons(seq);
