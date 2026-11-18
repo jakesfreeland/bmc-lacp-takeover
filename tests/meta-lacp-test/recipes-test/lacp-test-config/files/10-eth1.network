@@ -1,0 +1,9 @@
+[Match]
+Name=eth1
+
+[Network]
+ConfigureWithoutCarrier=yes
+Address=10.10.10.2/24
+Gateway=10.10.10.1
+LinkLocalAddressing=no
+IPv6AcceptRA=no

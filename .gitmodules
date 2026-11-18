@@ -1,0 +1,4 @@
+[submodule "tests/openbmc"]
+	path = tests/openbmc
+	url = https://github.com/canopybmc/canopybmc.git
+	shallow = true
